@@ -27,7 +27,7 @@ function createClient() {
   const bucket = env("DO_SPACES_BUCKET");
   let endpoint =
     env("DO_SPACES_ENDPOINT") || `https://${region}.digitaloceanspaces.com`;
-  const acl = (env("DO_SPACES_ACL") || "private") as ObjectCannedACL;
+  const acl = (env("DO_SPACES_ACL") || "public-read") as ObjectCannedACL;
 
   if (!key || !secret || !bucket) {
     throw new Error(

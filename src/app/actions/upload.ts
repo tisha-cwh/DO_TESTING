@@ -5,7 +5,9 @@ import {
   completeMultipartUpload,
   deleteSpacesFile,
   getSpacesFileSize,
+  listFiles,
   listKeysWithPrefix,
+  type SpacesFile,
   listUploadedParts,
   publicUrl,
   signUploadParts,
@@ -120,5 +122,17 @@ export async function uploadStep(step: UploadStep): Promise<UploadStepResult> {
   } catch (err) {
     console.error(`[uploadStep:${(step as { type?: string })?.type}]`, err);
     return { ok: false, error: "Upload failed on the server. Please try again." };
+  }
+}
+
+export async function listUploadedFiles(): Promise<
+  { ok: true; files: SpacesFile[] } | { ok: false; error: string }
+> {
+  try {
+    const files = await listFiles(`${UPLOAD_FOLDER}/`);
+    return { ok: true, files };
+  } catch (err) {
+    console.error("[listUploadedFiles]", err);
+    return { ok: false, error: "Could not load the file list." };
   }
 }

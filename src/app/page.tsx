@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { uploadStep } from "@/app/actions/upload";
+import { listUploadedFiles, uploadStep } from "@/app/actions/upload";
+import type { SpacesFile } from "@/lib/spaces";
 import {
   FILE_UPLOAD_MAX_BYTES,
   MiB,
@@ -17,6 +18,49 @@ function formatBytes(bytes: number): string {
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   return `${(bytes / Math.pow(1024, i)).toFixed(i >= 2 ? 2 : 0)} ${units[i]}`;
+}
+
+const IMAGE_EXT = ["jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "bmp", "ico"];
+const VIDEO_EXT = ["mp4", "webm", "mov", "m4v", "ogv"];
+const FILE_KINDS: Array<{ exts: string[]; label: string; color: string }> = [
+  { exts: ["pdf"], label: "PDF", color: "bg-red-500/15 text-red-300" },
+  { exts: ["mp3", "wav", "ogg", "m4a", "flac", "aac"], label: "AUDIO", color: "bg-purple-500/15 text-purple-300" },
+  { exts: ["zip", "rar", "7z", "tar", "gz"], label: "ZIP", color: "bg-amber-500/15 text-amber-300" },
+  { exts: ["doc", "docx", "txt", "rtf", "md"], label: "DOC", color: "bg-blue-500/15 text-blue-300" },
+  { exts: ["xls", "xlsx", "csv"], label: "SHEET", color: "bg-emerald-500/15 text-emerald-300" },
+  { exts: ["ppt", "pptx"], label: "SLIDES", color: "bg-orange-500/15 text-orange-300" },
+  { exts: ["mkv", "avi", "wmv", "flv"], label: "VIDEO", color: "bg-pink-500/15 text-pink-300" },
+];
+
+function FileThumb({ name, url }: { name: string; url: string }) {
+  const [failed, setFailed] = useState(false);
+  const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
+  const box = "h-12 w-12 shrink-0 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950";
+
+  if (!failed && IMAGE_EXT.includes(ext)) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element -- signed external URL, no optimization wanted
+      <img src={url} alt={name} loading="lazy" onError={() => setFailed(true)} className={`${box} object-cover`} />
+    );
+  }
+  if (!failed && VIDEO_EXT.includes(ext)) {
+    return (
+      // #t=0.5 makes the browser show a frame instead of a black box
+      <video src={`${url}#t=0.5`} preload="metadata" muted playsInline onError={() => setFailed(true)} className={`${box} object-cover`} />
+    );
+  }
+
+  const kind = FILE_KINDS.find((k) => k.exts.includes(ext));
+  const label = kind?.label ?? (VIDEO_EXT.includes(ext) ? "VIDEO" : IMAGE_EXT.includes(ext) ? "IMG" : ext.slice(0, 4).toUpperCase() || "FILE");
+  return (
+    <div className={`${box} flex flex-col items-center justify-center gap-0.5 ${kind?.color ?? "text-zinc-400"}`}>
+      <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+        <path d="M14 3v5h5" />
+      </svg>
+      <span className="text-[9px] font-semibold leading-none">{label}</span>
+    </div>
+  );
 }
 
 function abortError() {
@@ -72,6 +116,28 @@ export default function HomePage() {
   const [speedMBps, setSpeedMBps] = useState(0);
   const [uploadedUrl, setUploadedUrl] = useState("");
   const [error, setError] = useState("");
+  const [files, setFiles] = useState<SpacesFile[]>([]);
+  const [filesState, setFilesState] = useState<"loading" | "ready" | "error">(
+    "loading"
+  );
+
+  const loadFiles = async () => {
+    setFilesState("loading");
+    try {
+      const res = await listUploadedFiles();
+      if (!res.ok) throw new Error(res.error);
+      setFiles(res.files);
+      setFilesState("ready");
+    } catch (err) {
+      console.error(err);
+      setFilesState("error");
+    }
+  };
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadFiles();
+  }, []);
 
   const abortRef = useRef<AbortController | null>(null);
   const userCancelledRef = useRef(false);
@@ -220,6 +286,7 @@ export default function HomePage() {
       setProgress(100);
       setUploadedUrl(completed.url);
       setStatus("done");
+      loadFiles();
     } catch (err: unknown) {
       abortOnServer();
       if (userCancelledRef.current) {
@@ -241,7 +308,7 @@ export default function HomePage() {
   };
 
   return (
-    <main className="min-h-screen flex items-center justify-center bg-zinc-950 text-zinc-100 p-6">
+    <main className="min-h-screen flex flex-col items-center justify-center gap-6 bg-zinc-950 text-zinc-100 p-6">
       <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6 shadow-xl space-y-5">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">
@@ -356,6 +423,57 @@ export default function HomePage() {
           )}
         </div>
       </div>
+
+      {/* Uploaded Files List */}
+      <section className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/70 p-6 shadow-xl space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold tracking-tight">
+            Uploaded files{filesState === "ready" ? ` (${files.length})` : ""}
+          </h2>
+          <button
+            type="button"
+            onClick={loadFiles}
+            disabled={filesState === "loading"}
+            className="text-xs text-zinc-400 hover:text-zinc-200 disabled:opacity-40"
+          >
+            {filesState === "loading" ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+
+        {filesState === "error" && (
+          <p className="text-xs text-red-300">Could not load the file list.</p>
+        )}
+        {filesState === "ready" && files.length === 0 && (
+          <p className="text-xs text-zinc-500">No files uploaded yet.</p>
+        )}
+
+        {files.length > 0 && (
+          <ul className="divide-y divide-zinc-800 max-h-80 overflow-y-auto">
+            {files.map((f) => (
+              <li key={f.key} className="flex items-center gap-3 py-2.5">
+                <FileThumb name={f.name} url={f.url} />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-zinc-100" title={f.name}>
+                    {f.name}
+                  </p>
+                  <p className="text-xs font-mono text-zinc-500">
+                    {formatBytes(f.size)} •{" "}
+                    {new Date(f.lastModified).toLocaleString()}
+                  </p>
+                </div>
+                <a
+                  href={f.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="shrink-0 rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+                >
+                  Open
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </main>
   );
 }

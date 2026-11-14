@@ -4,6 +4,7 @@ import {
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
+  GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
   ListPartsCommand,
@@ -73,6 +74,44 @@ export async function listKeysWithPrefix(prefix: string): Promise<Set<string>> {
     token = res.IsTruncated ? res.NextContinuationToken : undefined;
   } while (token);
   return keys;
+}
+
+export type SpacesFile = {
+  key: string;
+  name: string;
+  size: number;
+  lastModified: string;
+  url: string; // presigned GET (1 hour), works for private files too
+};
+
+export async function listFiles(prefix: string): Promise<SpacesFile[]> {
+  const { client, bucket } = spaces();
+  const objects: Array<{ key: string; size: number; lastModified: Date }> = [];
+  let token: string | undefined;
+  do {
+    const res = await client.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: token })
+    );
+    for (const o of res.Contents ?? []) {
+      if (o.Key && !o.Key.endsWith("/")) {
+        objects.push({ key: o.Key, size: o.Size ?? 0, lastModified: o.LastModified ?? new Date(0) });
+      }
+    }
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+
+  objects.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
+  return Promise.all(
+    objects.map(async (o) => ({
+      key: o.key,
+      name: o.key.slice(prefix.length),
+      size: o.size,
+      lastModified: o.lastModified.toISOString(),
+      url: await getSignedUrl(client, new GetObjectCommand({ Bucket: bucket, Key: o.key }), {
+        expiresIn: 3600,
+      }),
+    }))
+  );
 }
 
 export async function startMultipartUpload(key: string, contentType: string) {

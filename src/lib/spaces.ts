@@ -1,73 +1,153 @@
-import fs from "node:fs";
-import path from "node:path";
-import { S3Client, type ObjectCannedACL } from "@aws-sdk/client-s3";
+// Server-only: never import this from a "use client" file (it reads the secret key).
+import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  DeleteObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  ListPartsCommand,
+  S3Client,
+  UploadPartCommand,
+  type ObjectCannedACL,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-function readEnvValue(name: string): string {
-  // Read live from .env.local if present so editing .env.local doesn't require a restart
-  try {
-    const envPath = path.join(process.cwd(), ".env.local");
-    if (fs.existsSync(envPath)) {
-      const lines = fs.readFileSync(envPath, "utf-8").split(/\r?\n/);
-      for (const raw of lines) {
-        const line = raw.trim();
-        if (!line || line.startsWith("#")) continue;
-        const eq = line.indexOf("=");
-        if (eq !== -1 && line.slice(0, eq).trim() === name) {
-          return line
-            .slice(eq + 1)
-            .trim()
-            .replace(/^['"]|['"]$/g, "");
-        }
-      }
-    }
-  } catch {
-    // Fallback to process.env
-  }
+function env(name: string): string {
   return process.env[name]?.trim() || "";
 }
 
-export function getSpacesClient() {
-  const key = readEnvValue("DO_SPACES_KEY");
-  const secret = readEnvValue("DO_SPACES_SECRET");
-  const region = readEnvValue("DO_SPACES_REGION") || "blr1";
-  const bucket = readEnvValue("DO_SPACES_BUCKET");
-  let endpoint =
-    readEnvValue("DO_SPACES_ENDPOINT") ||
-    `https://${region}.digitaloceanspaces.com`;
-  const acl = (readEnvValue("DO_SPACES_ACL") || "private") as ObjectCannedACL;
+let cached: ReturnType<typeof createClient> | null = null;
 
-  if (
-    !key ||
-    !secret ||
-    !bucket ||
-    key === "your_spaces_access_key" ||
-    secret === "your_spaces_secret_key"
-  ) {
+function createClient() {
+  const key = env("DO_SPACES_KEY");
+  const secret = env("DO_SPACES_SECRET");
+  const region = env("DO_SPACES_REGION") || "blr1";
+  const bucket = env("DO_SPACES_BUCKET");
+  let endpoint =
+    env("DO_SPACES_ENDPOINT") || `https://${region}.digitaloceanspaces.com`;
+  const acl = (env("DO_SPACES_ACL") || "private") as ObjectCannedACL;
+
+  if (!key || !secret || !bucket) {
     throw new Error(
-      "Missing DigitalOcean Spaces credentials. Please set DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_REGION, DO_SPACES_ENDPOINT, and DO_SPACES_BUCKET in .env.local"
+      "Missing DigitalOcean Spaces credentials (DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_BUCKET)"
     );
   }
 
-  // Normalize endpoint in case bucket name was accidentally included in DO_SPACES_ENDPOINT
-  endpoint = endpoint.replace(/\/+$/, "");
-  const bucketPrefix = `://${bucket}.`;
-  if (endpoint.includes(bucketPrefix)) {
-    endpoint = endpoint.replace(bucketPrefix, "://");
-  }
+  // Normalize endpoint in case the bucket name was included in DO_SPACES_ENDPOINT
+  endpoint = endpoint.replace(/\/+$/, "").replace(`://${bucket}.`, "://");
 
   const client = new S3Client({
     endpoint,
     region,
     forcePathStyle: false,
-    // Ensures clean compatibility with DigitalOcean Spaces (Ceph S3)
+    // Required: otherwise presigned URLs carry an extra checksum and the browser PUT fails
     requestChecksumCalculation: "WHEN_REQUIRED",
     responseChecksumValidation: "WHEN_REQUIRED",
-    credentials: {
-      accessKeyId: key,
-      secretAccessKey: secret,
-    },
+    credentials: { accessKeyId: key, secretAccessKey: secret },
   });
 
   const host = endpoint.replace(/^https?:\/\//, "");
-  return { client, bucket, region, endpoint, host, acl };
+  return { client, bucket, host, acl };
+}
+
+function spaces() {
+  cached ??= createClient();
+  return cached;
+}
+
+export function publicUrl(key: string): string {
+  const { bucket, host } = spaces();
+  return `https://${bucket}.${host}/${key}`;
+}
+
+export async function listKeysWithPrefix(prefix: string): Promise<Set<string>> {
+  const { client, bucket } = spaces();
+  const keys = new Set<string>();
+  let token: string | undefined;
+  do {
+    const res = await client.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: token })
+    );
+    for (const obj of res.Contents ?? []) if (obj.Key) keys.add(obj.Key);
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+  return keys;
+}
+
+export async function startMultipartUpload(key: string, contentType: string) {
+  const { client, bucket, acl } = spaces();
+  const res = await client.send(
+    new CreateMultipartUploadCommand({
+      Bucket: bucket,
+      Key: key,
+      ContentType: contentType,
+      ACL: acl,
+    })
+  );
+  if (!res.UploadId) throw new Error("CreateMultipartUpload returned no UploadId");
+  return res.UploadId;
+}
+
+export async function signUploadParts(key: string, uploadId: string, partNumbers: number[]) {
+  const { client, bucket } = spaces();
+  return Promise.all(
+    partNumbers.map(async (partNumber) => ({
+      partNumber,
+      url: await getSignedUrl(
+        client,
+        new UploadPartCommand({ Bucket: bucket, Key: key, UploadId: uploadId, PartNumber: partNumber }),
+        { expiresIn: 3600 }
+      ),
+    }))
+  );
+}
+
+export async function listUploadedParts(key: string, uploadId: string) {
+  const { client, bucket } = spaces();
+  const parts: Array<{ partNumber: number; etag: string }> = [];
+  let marker: string | undefined;
+  do {
+    const res = await client.send(
+      new ListPartsCommand({ Bucket: bucket, Key: key, UploadId: uploadId, PartNumberMarker: marker })
+    );
+    for (const p of res.Parts ?? []) {
+      if (p.PartNumber && p.ETag) parts.push({ partNumber: p.PartNumber, etag: p.ETag });
+    }
+    marker = res.IsTruncated ? res.NextPartNumberMarker : undefined;
+  } while (marker);
+  return parts;
+}
+
+export async function completeMultipartUpload(
+  key: string,
+  uploadId: string,
+  parts: Array<{ partNumber: number; etag: string }>
+) {
+  const { client, bucket } = spaces();
+  const sorted = [...parts].sort((a, b) => a.partNumber - b.partNumber);
+  await client.send(
+    new CompleteMultipartUploadCommand({
+      Bucket: bucket,
+      Key: key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: sorted.map((p) => ({ PartNumber: p.partNumber, ETag: p.etag })) },
+    })
+  );
+}
+
+export async function abortMultipartUpload(key: string, uploadId: string) {
+  const { client, bucket } = spaces();
+  await client.send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId }));
+}
+
+export async function getSpacesFileSize(key: string): Promise<number> {
+  const { client, bucket } = spaces();
+  const res = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+  return res.ContentLength ?? 0;
+}
+
+export async function deleteSpacesFile(key: string) {
+  const { client, bucket } = spaces();
+  await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 }

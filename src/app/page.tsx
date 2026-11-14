@@ -1,10 +1,16 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { uploadStep } from "@/app/actions/upload";
+import {
+  FILE_UPLOAD_MAX_BYTES,
+  MiB,
+  UPLOAD_PARALLEL_PARTS,
+  UPLOAD_PART_BYTES,
+} from "@/lib/uploadConfig";
 
-const MiB = 1024 * 1024;
-const MIN_MULTIPART_SIZE = 5 * MiB; // S3 / DO Spaces minimum part size
-const CONCURRENCY = 3; // Parallel chunk uploads to backend
+const SIGN_BATCH = 10;
+const MAX_ATTEMPTS = 5;
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -13,11 +19,47 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(i >= 2 ? 2 : 0)} ${units[i]}`;
 }
 
-function getChunkSize(fileSize: number): number {
-  // Base 8 MB chunks; automatically scales up if file > 75 GB so total parts stay < 9,500 (no size limit)
-  const base = 8 * MiB;
-  const minForCeiling = Math.ceil(fileSize / 9500);
-  return Math.ceil(Math.max(base, minForCeiling) / (5 * MiB)) * (5 * MiB);
+function abortError() {
+  return new DOMException("Aborted", "AbortError");
+}
+
+function sleep(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(abortError());
+      },
+      { once: true }
+    );
+  });
+}
+
+function putPart(
+  url: string,
+  body: Blob,
+  signal: AbortSignal,
+  onProgress: (loaded: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(abortError());
+    const xhr = new XMLHttpRequest();
+    const onAbort = () => xhr.abort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    xhr.open("PUT", url);
+    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    xhr.onload = () =>
+      xhr.status >= 200 && xhr.status < 300
+        ? resolve()
+        : reject(new Error(`Part upload failed (HTTP ${xhr.status})`));
+    xhr.onerror = () =>
+      reject(new Error("Network error while uploading (check Spaces CORS)"));
+    xhr.onabort = () => reject(abortError());
+    xhr.onloadend = () => signal.removeEventListener("abort", onAbort);
+    xhr.send(body);
+  });
 }
 
 export default function HomePage() {
@@ -32,23 +74,41 @@ export default function HomePage() {
   const [error, setError] = useState("");
 
   const abortRef = useRef<AbortController | null>(null);
+  const userCancelledRef = useRef(false);
   const activeUploadRef = useRef<{ key: string; uploadId: string } | null>(
     null
   );
 
+  useEffect(() => {
+    if (status !== "uploading") return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [status]);
+
   const selectFile = (selected: File | null) => {
     if (!selected || status === "uploading") return;
+    const tooBig = selected.size > FILE_UPLOAD_MAX_BYTES;
     setFile(selected);
-    setStatus("idle");
+    setStatus(tooBig ? "error" : "idle");
     setProgress(0);
     setUploadedBytes(0);
     setSpeedMBps(0);
     setUploadedUrl("");
-    setError("");
+    setError(tooBig ? "File is larger than 1 GB." : "");
+  };
+
+  const abortOnServer = () => {
+    const active = activeUploadRef.current;
+    activeUploadRef.current = null;
+    if (active) uploadStep({ type: "abort", ...active }).catch(() => {});
   };
 
   const handleUpload = async () => {
-    if (!file) return;
+    if (!file || file.size > FILE_UPLOAD_MAX_BYTES) return;
 
     setStatus("uploading");
     setProgress(0);
@@ -59,137 +119,125 @@ export default function HomePage() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    userCancelledRef.current = false;
+    const signal = controller.signal;
     const startTime = Date.now();
 
     try {
-      // Small files (< 5 MB): single backend upload
-      if (file.size < MIN_MULTIPART_SIZE) {
-        const res = await fetch("/api/upload?action=single", {
-          method: "POST",
-          headers: {
-            "x-file-name": encodeURIComponent(file.name),
-            "x-content-type": file.type || "application/octet-stream",
-          },
-          body: file,
-          signal: controller.signal,
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Upload failed");
-
-        setUploadedBytes(file.size);
-        setProgress(100);
-        setUploadedUrl(data.url);
-        setStatus("done");
-        return;
-      }
-
-      // Heavy files (2-3 GB+, no limit): Chunked Multipart Upload via Next.js Backend
-      const initRes = await fetch("/api/upload?action=init", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: file.name,
-          contentType: file.type || "application/octet-stream",
-        }),
-        signal: controller.signal,
+      // 1. start
+      const started = await uploadStep({
+        type: "start",
+        name: file.name,
+        size: file.size,
+        contentType: file.type || "application/octet-stream",
       });
-      const initData = await initRes.json();
-      if (!initRes.ok) throw new Error(initData.error || "Failed to start upload");
-
-      const { uploadId, key } = initData as { uploadId: string; key: string };
+      if (!started.ok) throw new Error(started.error);
+      if (!("uploadId" in started)) throw new Error("Unexpected server response");
+      const { key, uploadId } = started;
       activeUploadRef.current = { key, uploadId };
+      if (signal.aborted) throw abortError();
 
-      const chunkSize = getChunkSize(file.size);
-      const totalParts = Math.ceil(file.size / chunkSize);
-      const queue = Array.from({ length: totalParts }, (_, i) => i + 1);
-      const completedParts: Array<{ PartNumber: number; ETag: string }> = [];
-      let totalDoneBytes = 0;
+      const partCount = Math.max(1, Math.ceil(file.size / UPLOAD_PART_BYTES));
+      const urlCache = new Map<number, string>();
+      const loadedPerPart = new Map<number, number>();
 
-      const worker = async () => {
-        while (queue.length > 0) {
-          const partNumber = queue.shift();
-          if (!partNumber) return;
+      const reportProgress = () => {
+        let done = 0;
+        for (const v of loadedPerPart.values()) done += v;
+        const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000);
+        setUploadedBytes(done);
+        setProgress(Math.min(99, Math.floor((done / file.size) * 100)));
+        setSpeedMBps(done / MiB / elapsedSec);
+      };
 
-          const start = (partNumber - 1) * chunkSize;
-          const end = Math.min(start + chunkSize, file.size);
-          // file.slice() streams from disk without loading the multi-GB file into RAM
-          const chunk = file.slice(start, end);
+      // 2. sign: presigned URLs in batches of 10, starting at the given part
+      const signFrom = async (partNumber: number) => {
+        const partNumbers: number[] = [];
+        for (let n = partNumber; n <= partCount && partNumbers.length < SIGN_BATCH; n++) {
+          partNumbers.push(n);
+        }
+        const signed = await uploadStep({ type: "sign", key, uploadId, partNumbers });
+        if (!signed.ok) throw new Error(signed.error);
+        if (!("urls" in signed)) throw new Error("Unexpected server response");
+        for (const { partNumber: n, url } of signed.urls) urlCache.set(n, url);
+      };
 
-          const partRes = await fetch(
-            `/api/upload?action=part&key=${encodeURIComponent(
-              key
-            )}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`,
-            {
-              method: "POST",
-              body: chunk,
-              signal: controller.signal,
-            }
-          );
+      // 3. PUT each part directly to Spaces, up to 5 attempts (1s, 2s, 3s… backoff)
+      const uploadPart = async (partNumber: number) => {
+        const start = (partNumber - 1) * UPLOAD_PART_BYTES;
+        const end = Math.min(start + UPLOAD_PART_BYTES, file.size);
+        // file.slice() reads lazily from disk, so the whole file is never loaded into RAM
+        const chunk = file.slice(start, end);
 
-          const partData = await partRes.json();
-          if (!partRes.ok) {
-            throw new Error(partData.error || `Failed on part ${partNumber}`);
+        for (let attempt = 1; ; attempt++) {
+          try {
+            if (attempt > 1) urlCache.delete(partNumber); // fresh signed URL on every retry
+            if (!urlCache.has(partNumber)) await signFrom(partNumber);
+            await putPart(urlCache.get(partNumber)!, chunk, signal, (loaded) => {
+              loadedPerPart.set(partNumber, loaded);
+              reportProgress();
+            });
+            urlCache.delete(partNumber);
+            loadedPerPart.set(partNumber, end - start);
+            reportProgress();
+            return;
+          } catch (err) {
+            if (signal.aborted || attempt >= MAX_ATTEMPTS) throw err;
+            loadedPerPart.set(partNumber, 0);
+            reportProgress();
+            await sleep(1000 * attempt, signal);
           }
-
-          completedParts.push({
-            PartNumber: partNumber,
-            ETag: partData.etag,
-          });
-
-          totalDoneBytes += end - start;
-          const pct = Math.min(99, Math.round((totalDoneBytes / file.size) * 100));
-          const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000);
-
-          setUploadedBytes(totalDoneBytes);
-          setProgress(pct);
-          setSpeedMBps(totalDoneBytes / MiB / elapsedSec);
         }
       };
 
+      const queue = Array.from({ length: partCount }, (_, i) => i + 1);
+      let firstError: unknown = null;
+      const worker = async () => {
+        while (queue.length > 0 && !signal.aborted) {
+          const partNumber = queue.shift()!;
+          try {
+            await uploadPart(partNumber);
+          } catch (err) {
+            firstError ??= err;
+            controller.abort(); // one part failed for good: stop all other workers
+            return;
+          }
+        }
+      };
       await Promise.all(
-        Array.from({ length: Math.min(CONCURRENCY, totalParts) }, () => worker())
+        Array.from({ length: Math.min(UPLOAD_PARALLEL_PARTS, partCount) }, worker)
       );
+      if (firstError) throw firstError;
+      if (signal.aborted) throw abortError();
 
-      // Finalize Multipart Upload on DigitalOcean Spaces
-      const completeRes = await fetch("/api/upload?action=complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key, uploadId, parts: completedParts }),
-        signal: controller.signal,
-      });
-      const completeData = await completeRes.json();
-      if (!completeRes.ok) {
-        throw new Error(completeData.error || "Failed to complete upload");
-      }
+      // 4. complete (server reads ETags itself via ListParts)
+      const completed = await uploadStep({ type: "complete", key, uploadId, partCount });
+      if (!completed.ok) throw new Error(completed.error);
+      if (!("url" in completed)) throw new Error("Unexpected server response");
 
       activeUploadRef.current = null;
       setUploadedBytes(file.size);
       setProgress(100);
-      setUploadedUrl(completeData.url);
+      setUploadedUrl(completed.url);
       setStatus("done");
     } catch (err: unknown) {
-      if (controller.signal.aborted) {
+      abortOnServer();
+      if (userCancelledRef.current) {
+        userCancelledRef.current = false;
         setStatus("idle");
         setProgress(0);
         setUploadedBytes(0);
         return;
       }
+      console.error(err);
       setStatus("error");
       setError(err instanceof Error ? err.message : "Upload failed");
     }
   };
 
-  const handleCancel = async () => {
+  const handleCancel = () => {
+    userCancelledRef.current = true;
     abortRef.current?.abort();
-    const active = activeUploadRef.current;
-    activeUploadRef.current = null;
-    if (active) {
-      fetch("/api/upload?action=abort", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(active),
-      }).catch(() => {});
-    }
   };
 
   return (
@@ -200,7 +248,7 @@ export default function HomePage() {
             DigitalOcean Spaces Uploader
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Backend chunked multipart upload • No file size limit
+            Direct multipart upload to Spaces • Up to 1 GB
           </p>
         </div>
 
@@ -237,9 +285,7 @@ export default function HomePage() {
               <p className="text-sm text-zinc-300">
                 Click or drop a file here
               </p>
-              <p className="text-xs text-zinc-500">
-                Supports 2–3 GB+ heavy files with no limit
-              </p>
+              <p className="text-xs text-zinc-500">Files up to 1 GB</p>
             </div>
           )}
         </label>
@@ -301,7 +347,7 @@ export default function HomePage() {
           ) : (
             <button
               type="button"
-              disabled={!file}
+              disabled={!file || (file?.size ?? 0) > FILE_UPLOAD_MAX_BYTES}
               onClick={handleUpload}
               className="w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed transition"
             >
